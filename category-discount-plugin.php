@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Category Discount Manager
  * Description: Zarządzanie promocjami dla wybranych kategorii w WooCommerce.
- * Version: 1.0
+ * Version: 1.0.1
  * Author: Michał Łuczak
  * Text Domain: category-discount
  */
@@ -177,5 +177,48 @@ function cdm_redirect_to_promotions_list($location, $post_id) {
     }
 
     return $location;
+}
+
+add_action('before_delete_post', 'cdm_remove_discount_on_delete');
+
+function cdm_remove_discount_on_delete($post_id) {
+    // Sprawdź, czy usuwany post to typ 'category_discount'
+    if (get_post_type($post_id) !== 'category_discount') {
+        return;
+    }
+
+    // Pobierz szczegóły promocji
+    $category = get_post_meta($post_id, 'cdm_category', true);
+    $percent = (float) get_post_meta($post_id, 'cdm_discount', true);
+
+    if (!$category || !$percent) {
+        return;
+    }
+
+    // Pobierz produkty z danej kategorii
+    $args = [
+        'post_type' => 'product',
+        'posts_per_page' => -1,
+        'tax_query' => [
+            [
+                'taxonomy' => 'product_cat',
+                'field' => 'id',
+                'terms' => $category,
+            ],
+        ],
+    ];
+
+    $products = get_posts($args);
+
+    foreach ($products as $product) {
+        $product_id = $product->ID;
+        $product_obj = wc_get_product($product_id);
+
+        // Resetuj cenę promocyjną
+        if ($product_obj->get_sale_price()) {
+            $product_obj->set_sale_price('');
+            $product_obj->save();
+        }
+    }
 }
 ?>
