@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Category Discount Manager
  * Description: Zarządzanie promocjami dla wybranych kategorii w WooCommerce.
- * Version: 1.0.1
+ * Version: 1.0.5
  * Author: Michał Łuczak
  * Text Domain: category-discount
  */
@@ -17,7 +17,7 @@ function cdm_register_discount_post_type() {
     register_post_type('category_discount', [
         'labels' => [
             'name' => 'Promocje',
-            'singular_name' => 'Category Discount',
+            'singular_name' => 'Promocja',
             'add_new' => 'Dodaj nową promocję',
             'add_new_item' => 'Dodaj nową promocję',
             'edit_item' => 'Edytuj promocję',
@@ -32,7 +32,6 @@ function cdm_register_discount_post_type() {
     ]);
 }
 
-// Dodawanie metaboxów do edycji promocji
 add_action('add_meta_boxes', 'cdm_add_discount_meta_boxes');
 
 function cdm_add_discount_meta_boxes() {
@@ -91,7 +90,6 @@ function cdm_discount_meta_box_callback($post) {
     <?php
 }
 
-// Zapisywanie danych promocji
 add_action('save_post', 'cdm_save_discount_meta');
 
 function cdm_save_discount_meta($post_id) {
@@ -101,6 +99,7 @@ function cdm_save_discount_meta($post_id) {
     update_post_meta($post_id, 'cdm_category', sanitize_text_field($_POST['cdm_category']));
     update_post_meta($post_id, 'cdm_discount', floatval($_POST['cdm_discount']));
     update_post_meta($post_id, 'cdm_start_date', sanitize_text_field($_POST['cdm_start_date']));
+
     $unlimited = isset($_POST['cdm_unlimited']) ? '1' : '';
     update_post_meta($post_id, 'cdm_unlimited', $unlimited);
 
@@ -110,60 +109,106 @@ function cdm_save_discount_meta($post_id) {
         delete_post_meta($post_id, 'cdm_end_date');
     }
 
-    // Wywołanie aktualizacji cen promocyjnych
-    cdm_update_sale_price();
+    cdm_update_sale_prices();
 }
 
-// Funkcja do aktualizacji cen promocyjnych produktów
-function cdm_update_sale_price() {
-    $discounts = get_posts([
+function cdm_update_sale_prices($deleted_category = null) {
+    $args = [
         'post_type' => 'category_discount',
         'post_status' => 'publish',
-        'numberposts' => -1,
-    ]);
+        'posts_per_page' => -1,
+    ];
+    $promotions = get_posts($args);
 
-    $now = current_time('Y-m-d');
+    $active_promotions = [];
+    foreach ($promotions as $promo) {
+        $cat_id = get_post_meta($promo->ID, 'cdm_category', true);
+        $discount = (float) get_post_meta($promo->ID, 'cdm_discount', true);
+        $start_date = get_post_meta($promo->ID, 'cdm_start_date', true);
+        $unlimited = get_post_meta($promo->ID, 'cdm_unlimited', true);
+        $end_date = $unlimited === '1' ? '' : get_post_meta($promo->ID, 'cdm_end_date', true);
 
-    foreach ($discounts as $discount) {
-        $category = get_post_meta($discount->ID, 'cdm_category', true);
-        $percent = (float) get_post_meta($discount->ID, 'cdm_discount', true);
-        $start_date = get_post_meta($discount->ID, 'cdm_start_date', true);
-        $end_date = get_post_meta($discount->ID, 'cdm_end_date', true);
-        $unlimited = get_post_meta($discount->ID, 'cdm_unlimited', true);
+        $active_promotions[$cat_id] = [
+            'discount' => $discount,
+            'start_date' => $start_date,
+            'end_date' => $end_date,
+            'unlimited' => ($unlimited === '1')
+        ];
+    }
 
-        if (!$start_date) continue;
+    $categories_to_update = $deleted_category ? [$deleted_category] : (empty($active_promotions) ? [] : array_keys($active_promotions));
 
-        $current_date = strtotime($now);
-        $start_timestamp = strtotime($start_date);
-        $end_timestamp = $unlimited === '1' ? PHP_INT_MAX : strtotime($end_date . ' 23:59:59');
+    if ($deleted_category && !isset($active_promotions[$deleted_category])) {
+        $categories_to_update[] = $deleted_category;
+    }
 
-        if ($current_date >= $start_timestamp && $current_date <= $end_timestamp) {
-            $args = [
-                'post_type' => 'product',
-                'posts_per_page' => -1,
-                'tax_query' => [
-                    [
-                        'taxonomy' => 'product_cat',
-                        'field' => 'id',
-                        'terms' => $category,
-                    ],
+    $categories_to_update = array_unique($categories_to_update);
+
+    foreach ($categories_to_update as $cat_id) {
+        $product_args = [
+            'post_type' => 'product',
+            'post_status' => 'publish',
+            'posts_per_page' => -1,
+            'tax_query' => [
+                [
+                    'taxonomy' => 'product_cat',
+                    'field' => 'term_id',
+                    'terms' => $cat_id,
                 ],
-            ];
+            ],
+        ];
 
-            $products = get_posts($args);
+        $products = get_posts($product_args);
 
-            foreach ($products as $product) {
-                $product_id = $product->ID;
-                $product_obj = wc_get_product($product_id);
-                $regular_price = $product_obj->get_regular_price();
+        foreach ($products as $product_post) {
+            $product_id = $product_post->ID;
+            $product = wc_get_product($product_id);
 
-                if ($regular_price) {
-                    $sale_price = $regular_price - ($regular_price * ($percent / 100));
-                    $product_obj->set_sale_price($sale_price);
-                    $product_obj->save();
+            if (!$product) continue;
+
+            $regular_price = $product->get_regular_price();
+            if (!$regular_price) continue;
+
+            if (isset($active_promotions[$cat_id])) {
+                $promo = $active_promotions[$cat_id];
+                $discounted_price = $regular_price - ($regular_price * ($promo['discount'] / 100));
+                $discounted_price = round($discounted_price, 2);
+
+                update_post_meta($product_id, '_sale_price', $discounted_price);
+                update_post_meta($product_id, '_price', $discounted_price);
+
+                $start_timestamp = $promo['start_date'] ? strtotime($promo['start_date']) : '';
+                $end_timestamp = $promo['end_date'] ? strtotime($promo['end_date']) : '';
+
+                if ($start_timestamp) {
+                    update_post_meta($product_id, '_sale_price_dates_from', $start_timestamp);
+                } else {
+                    delete_post_meta($product_id, '_sale_price_dates_from');
                 }
+
+                if (!$promo['unlimited'] && $end_timestamp) {
+                    update_post_meta($product_id, '_sale_price_dates_to', $end_timestamp);
+                } else {
+                    delete_post_meta($product_id, '_sale_price_dates_to');
+                }
+            } else {
+                delete_post_meta($product_id, '_sale_price');
+                update_post_meta($product_id, '_price', $regular_price);
+                delete_post_meta($product_id, '_sale_price_dates_from');
+                delete_post_meta($product_id, '_sale_price_dates_to');
             }
+
+            wc_delete_product_transients($product_id);
         }
+    }
+}
+
+add_action('wp_trash_post', 'cdm_update_sale_prices_after_trash');
+
+function cdm_update_sale_prices_after_trash($post_id) {
+    if (get_post_type($post_id) === 'category_discount') {
+        $trashed_category = get_post_meta($post_id, 'cdm_category', true);
+        cdm_update_sale_prices($trashed_category);
     }
 }
 
@@ -178,47 +223,3 @@ function cdm_redirect_to_promotions_list($location, $post_id) {
 
     return $location;
 }
-
-add_action('before_delete_post', 'cdm_remove_discount_on_delete');
-
-function cdm_remove_discount_on_delete($post_id) {
-    // Sprawdź, czy usuwany post to typ 'category_discount'
-    if (get_post_type($post_id) !== 'category_discount') {
-        return;
-    }
-
-    // Pobierz szczegóły promocji
-    $category = get_post_meta($post_id, 'cdm_category', true);
-    $percent = (float) get_post_meta($post_id, 'cdm_discount', true);
-
-    if (!$category || !$percent) {
-        return;
-    }
-
-    // Pobierz produkty z danej kategorii
-    $args = [
-        'post_type' => 'product',
-        'posts_per_page' => -1,
-        'tax_query' => [
-            [
-                'taxonomy' => 'product_cat',
-                'field' => 'id',
-                'terms' => $category,
-            ],
-        ],
-    ];
-
-    $products = get_posts($args);
-
-    foreach ($products as $product) {
-        $product_id = $product->ID;
-        $product_obj = wc_get_product($product_id);
-
-        // Resetuj cenę promocyjną
-        if ($product_obj->get_sale_price()) {
-            $product_obj->set_sale_price('');
-            $product_obj->save();
-        }
-    }
-}
-?>
